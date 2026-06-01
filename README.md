@@ -139,37 +139,37 @@ pytest -v
 
 ## Task 2 — Bug investigation
 
-**Bug report:** Duplicate transfers on the GH-NG corridor. A customer taps Send, the app shows a spinner for 8 to 12 seconds, then displays an error saying the transfer failed. But when we check the database, the transfer was actually created successfully, and in some cases it was created twice. Customer support has had to manually reverse 14 transfers this week.
+**Bug report:** Duplicate transfers on the GH-NG corridor. A customer taps Send, the app shows a spinner for 8 to 12 seconds, then displays an error saying the transfer failed. But the transfer was actually created in the database, and in some cases it was created twice. Fourteen duplicates had to be reversed this week.
 
-**What we know:** The mobile app retries the API call automatically after 10 seconds if it does not receive a response. The /transfer endpoint does not return any response within that timeout window during high load. The database has no unique constraint on (sender_id, amount, recipient_id, created_at).
+**What we know:** The app retries automatically after 10 seconds if it gets no response. The /transfer endpoint is too slow under high load to respond in time. The database has no unique constraint on (sender_id, amount, recipient_id, created_at).
 
 ---
 
 ### 1. What is causing the duplicate transfers?
 
-When a customer taps Send, the mobile app sends one POST request to /transfer. Under high load, the backend is slow. It actually creates and saves the transfer in the database, but the HTTP response does not get back to the app in time.
+When a customer taps Send, the app sends one POST request to /transfer. Under high load, the backend saves the transfer to the database but the response does not reach the app before the timeout.
 
-After 10 seconds, the app automatically sends the same request again because it assumes the first one failed. The server treats this second request as a brand new transfer. There is no idempotency check, and nothing in the database stops the duplicate insert. So a second row gets created.
+After 10 seconds the app sends the same request again. The server has no way to know this is a retry. With no idempotency check and no unique constraint, it inserts a second row.
 
-From the customer's side, they tapped once and saw an error. From the system's side, the money already moved. In the worst cases, it moved twice.
+The customer tapped once and saw an error. Behind the scenes the money already moved, and sometimes it moved twice.
 
 ---
 
 ### 2. Two code level fixes and the order I would deploy them
 
-The first fix I would implement is idempotency keys at the API layer. Each time a customer taps Send, the app generates a unique key and sends it with the request, for example as an Idempotency-Key header. The server stores that key together with the transfer result. If the same key comes in again, the server returns the original result instead of creating a new transfer.
+First, I would add idempotency keys at the API layer. Each Send action gets a unique key from the app, sent as an Idempotency-Key header. The server stores that key with the transfer result. If the same key arrives again, return the original result instead of creating a new transfer.
 
-The second fix is a database unique constraint on that idempotency key. This is a safety net so that even if something slips through the API layer, the database still rejects a duplicate insert.
+Second, I would add a database unique constraint on that key as a safety net.
 
-I would deploy the idempotency fix first. It makes retries safe straight away without making things worse for the user. If you add the database constraint first while the app is still retrying blindly, duplicate inserts will start throwing database errors that surface as 500 responses. That makes the customer experience worse, not better. You also need to clean up the 14 existing duplicates before adding a strict constraint, otherwise the migration will fail on dirty data.
+I would deploy idempotency first. It makes retries safe immediately. Adding the constraint first while the app still retries blindly turns duplicate inserts into database errors that show up as 500 responses, which makes things worse for customers. The 14 existing duplicates also need to be cleaned up before the migration, or it fails on dirty data.
 
 ---
 
 ### 3. How I would identify and reverse the 14 affected transfers
 
-To find all affected transactions, I would query every transfer on the GH-NG corridor during the incident window. I would group them by sender_id, amount, and recipient_id and look for groups with more than one record. I would then narrow it down to groups where the created_at timestamps are within about 10 seconds of each other, since that matches the retry window. If request logs are available, I would cross check those to confirm it was the same user action and not two separate sends.
+To find affected transactions, I would query all GH-NG transfers in the incident window, group by sender_id, amount, and recipient_id, and look for more than one record per group. I would focus on groups where created_at timestamps are within about 10 seconds, matching the retry window, and cross check request logs to confirm the same user action.
 
-For the reversal process, I would first pause new transfers on that corridor and temporarily disable auto retry in the app. For each duplicate group, I would keep the earliest transfer as the valid one and reverse the extras. Before reversing anything, I would check with the mobile money partner whether the payout has already gone out. If it has not settled yet, void it. If it has already been paid, run an idempotent reversal tied back to the original transfer. I would refund any fees that were charged twice, mark reversed rows clearly in the database so nothing gets reversed twice, and only turn the corridor back on once the ledger balances check out.
+For reversals, I would pause the corridor and disable auto retry. For each duplicate group, keep the earliest transfer and reverse the rest. Check with the mobile money partner whether each extra payout has settled. Void if not yet paid out, otherwise run an idempotent reversal tied to the original. Refund double charged fees, mark reversed rows clearly, and only re enable the corridor once the ledger balances.
 
 ---
 
